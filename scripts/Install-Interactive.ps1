@@ -47,8 +47,11 @@ try {
     $sharedRaw = Read-Host "Shared workspace folder path (blank for $defaultShared, 'none' to skip)"
     $sharedWorkspace = if (!$sharedRaw) { $defaultShared } elseif ($sharedRaw.Trim().ToLowerInvariant() -eq 'none') { '' } else { $sharedRaw.Trim() }
 
-    $syncChatsRaw = Read-Host 'Also copy existing AI chat history from main account? (requires Python 3) [y/N, default: N]'
-    $doSyncChats = ($syncChatsRaw -match '^[yY]')
+    $syncChatsRaw = Read-Host 'Enable automatic incremental sync for Projects & AI chats? (requires Python 3 for chats) [Y/n, default: Y]'
+    $doAutoSync = !($syncChatsRaw -match '^[nN]')
+
+    $bgTaskRaw = Read-Host 'Register 10-minute silent background auto-sync Windows task? [Y/n, default: Y]'
+    $doBgTask = !($bgTaskRaw -match '^[nN]')
 
     $accounts = @()
     for ($i = 2; $i -le ($extraCount + 1); $i++) {
@@ -62,15 +65,33 @@ try {
     New-Item -ItemType Directory -Force -Path $baseDir, (Join-Path $baseDir 'status'), $credDir | Out-Null
     $scriptFiles = @(
         'SilentLaunch.vbs',
+        'SilentAutoSync.vbs',
         'Setup-Elevated.ps1',
         'SubUser-Init.ps1',
         'SubUser-Launch.ps1',
+        'SubUser-SyncTick.ps1',
+        'AutoSync-Tick.ps1',
         'Host-Launch.ps1',
         'Manage-Accounts.ps1',
         'sync_chats.py'
     )
     foreach ($sf in $scriptFiles) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $sf) -Destination (Join-Path $baseDir $sf) -Force
+    }
+
+    # Deploy sync-config.json if missing
+    $syncCfgDest = Join-Path $baseDir 'sync-config.json'
+    if (!(Test-Path -LiteralPath $syncCfgDest -PathType Leaf)) {
+        $syncObj = [ordered]@{
+            autoSyncOnLaunch = $doAutoSync
+            autoPushOnExit = $doAutoSync
+            syncProjects = $true
+            syncChats = $doAutoSync
+            syncBrain = $doAutoSync
+            backgroundIntervalMinutes = 10
+        }
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($syncCfgDest, ($syncObj | ConvertTo-Json -Depth 4), $utf8NoBom)
     }
 
     # Create proxies.json if missing
@@ -117,11 +138,14 @@ try {
     & "$baseDir\Manage-Accounts.ps1" -Action Sync -ForceConfig
     if ($LASTEXITCODE -ne 0) { throw 'Profile sync failed.' }
 
-    if ($doSyncChats) {
-        Write-Host 'Syncing AI chat history (SQLite online hot backup)...' -ForegroundColor Yellow
+    if ($doAutoSync) {
+        Write-Host 'Initializing incremental sync pool and syncing AI chat history...' -ForegroundColor Yellow
         $global:LASTEXITCODE = 0
-        & "$baseDir\Manage-Accounts.ps1" -Action SyncChats
-        if ($LASTEXITCODE -ne 0) { throw 'Chat sync failed.' }
+        & "$baseDir\Manage-Accounts.ps1" -Action AutoSyncNow
+        if ($LASTEXITCODE -ne 0) { Write-Host 'Warning: initial chat auto-sync encountered an issue (ensure Python 3 is installed).' -ForegroundColor Yellow }
+    }
+    if ($doBgTask) {
+        & "$baseDir\Manage-Accounts.ps1" -Action EnableAutoSync -IntervalMinutes 10
     }
 
     # 6. Create desktop shortcuts

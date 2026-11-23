@@ -19,9 +19,11 @@
 - **开机锁屏无感隐藏**：通过标准注册表项 `Winlogon\SpecialAccounts\UserList` 隐藏辅助本地账户，日常开机登录界面只显示你的原主账号。
 - **独立程序副本**：每个副账号在各自 `%LOCALAPPDATA%\Programs\antigravity` 拥有独立程序副本并注册各自用户的 `antigravity://` 协议，避免自动更新锁文件冲突。
 - **灵活的代理隔离**：支持自动跟随当前系统代理（或 TUN 模式），也支持在 `proxies.json` 中为**每个账号单独绑定不同本地代理端口与可选出口地区校验**。
-- **Projects & 历史 AI 对话无损增量同步**：
-  - 一键同步主账号全部真实 Projects（自动对具体项目目录授予最小读写权限，不暴露主用户 `AppData`，并自动为副账号配置 Git `safe.directory`）。
-  - 基于 Python 标准库 **`sqlite3.Connection.backup()`** 在线热备份主账号对话数据库（无需关闭主窗口），按 `last_modified_time` **增量合并**到副账号（保留副账号自己新建的对话，绝不误删）。
+- **Projects & 历史 AI 对话全自动双向增量同步**：
+  - **启动前秒同步（冷启动生效）**：双击任意副账号时自动增量拉取主账号及其他账号的最新 Projects 和对话（借助持久化中心同步池 `sync_pool`，增量同步通常仅需 `~1 秒`）。
+  - **关闭后自动回传**：副账号窗口关闭后，自动把该账号新聊的对话与新建 Projects 合并回中心同步池。
+  - **后台每 10 分钟静默巡检**：通过用户级 Windows 计划任务自动只读热备份所有账号的新对话（基于 Python 标准库 `sqlite3.Connection.backup()`），并仅向当前空闲未运行的账号增量写入，**绝不强关正在使用的窗口、绝不损坏 SQLite 数据库、绝不误删副账号自己的新对话**。
+  - 自动对具体项目目录授予最小读写权限（不暴露主用户 `AppData`），并自动配置各副账号的 Git `safe.directory`。
 
 ---
 
@@ -93,33 +95,59 @@ C:\ProgramData\AntigravityMulti\proxies.json
 
 ---
 
+## 自动同步配置（`sync-config.json`）
+
+运行时配置文件位于 `C:\ProgramData\AntigravityMulti\sync-config.json`（模板见 [`config/sync-config.example.json`](./config/sync-config.example.json)）：
+
+```json
+{
+  "autoSyncOnLaunch": true,
+  "autoPushOnExit": true,
+  "syncProjects": true,
+  "syncChats": true,
+  "syncBrain": true,
+  "backgroundIntervalMinutes": 10
+}
+```
+
+- `autoSyncOnLaunch`：冷启动任意副账号前自动增量同步最新 Projects 与对话。
+- `autoPushOnExit`：副账号窗口关闭后自动把新对话回传到中心同步池 `sync_pool`。
+- **安全机制**：对运行中账号仅执行 SQLite 只读热备份（Pull），对数据库写入（Push）仅在目标账号空闲未运行时执行，避免多进程写锁损坏。
+
+---
+
 ## 日常维护命令
 
 所有维护操作统一由 `C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1` 提供：
 
 ```powershell
-# 1. 查看当前已配置的副账号与运行中的并发实例
+# 1. 立即执行一次全账号增量双向自动同步（不打断运行中窗口）
+powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action AutoSyncNow
+
+# 2. 开启 / 修改 / 关闭后台静默定时自动同步（默认每 10 分钟，无需管理员权限）
+powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action EnableAutoSync -IntervalMinutes 10
+powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action DisableAutoSync
+
+# 3. 查看当前已配置的副账号与运行中的并发实例
 powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action Status
 
-# 2. 主账号更新 Antigravity 或安装新插件后，同步到所有副账号（可选加 -ForceConfig 覆盖全局设置）
+# 4. 主账号更新 Antigravity 或安装新插件后，同步到所有副账号（可选加 -ForceConfig 覆盖全局设置）
 powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action Sync
 
-# 3. 仅快速同步新增的 Projects 及目录读写权限（无需关闭副账号窗口）
+# 5. 仅快速同步新增的 Projects 及目录读写权限（无需关闭副账号窗口）
 powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action SyncProjects
 
-# 4. 热备份并增量合并主账号的历史 AI 对话与 brain 产物到所有副账号（保留副账号已有新对话）
+# 6. 强制全量合并主账号对话到所有副账号（会先安全关闭已打开的副账号窗口）
 powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action SyncChats
 
-# 5. 手动给任意项目文件夹授予所有副账号的读写权限
+# 7. 手动给任意项目文件夹授予所有副账号的读写权限
 powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action GrantFolder -FolderPath "D:\MyProject"
 
-# 6. 一键同时启动主账号与全部副账号
+# 8. 一键同时启动主账号与全部副账号
 powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action LaunchAll
 
-# 7. 继续新增第 5 个账号
+# 9. 继续新增第 5 个账号 / 移除指定副账号
 powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action Add -AccountNumber 5
-
-# 8. 移除指定副账号（删除本地用户、加密凭据及桌面快捷方式）
 powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action Remove -AccountName AgyAcc4
 ```
 

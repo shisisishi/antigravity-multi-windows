@@ -78,16 +78,18 @@ try {
         }
     }
 
-    # 3. Configure ACLs on ProgramData\AntigravityMulti and status directory
+    # 3. Configure ACLs on ProgramData\AntigravityMulti, status, and sync_pool directories
     $baseDir = 'C:\ProgramData\AntigravityMulti'
     $statusDir = Join-Path $baseDir 'status'
-    New-Item -ItemType Directory -Force -Path $statusDir | Out-Null
+    $poolDir = Join-Path $baseDir 'sync_pool'
+    New-Item -ItemType Directory -Force -Path $statusDir, $poolDir | Out-Null
 
     & icacls.exe $baseDir /grant "${MainUser}:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" /T /C | Out-Null
     foreach ($acct in $AccountList) {
         & icacls.exe $statusDir /grant "${acct}:(OI)(CI)M" /C | Out-Null
+        & icacls.exe $poolDir /grant "${acct}:(OI)(CI)M" /C | Out-Null
     }
-    Write-Log 'Configured ProgramData\AntigravityMulti permissions'
+    Write-Log 'Configured ProgramData\AntigravityMulti permissions (including sync_pool)'
 
     # 4. Create optional shared workspace folder and grant full control to main + sub accounts
     if ($SharedWorkspace) {

@@ -122,9 +122,31 @@ try {
 
     $subScript = Join-Path $baseDir 'SubUser-Launch.ps1'
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$subScript`" -ProxyServer `"$proxyServer`" -ProxyEnable $proxyEnable"
 
-    Write-HostLog "Starting isolated process as $($cred.UserName) (ProxyEnable=$proxyEnable ProxyServer=$proxyServer)"
+    # Optional pre-launch incremental pull from main account into shared sync_pool
+    $syncFlags = ''
+    $syncCfgPath = Join-Path $baseDir 'sync-config.json'
+    if (Test-Path -LiteralPath $syncCfgPath -PathType Leaf) {
+        try {
+            $sc = Get-Content -LiteralPath $syncCfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($sc.autoSyncOnLaunch) {
+                Write-HostLog 'Running pre-launch incremental pull (Main -> sync_pool)...'
+                try {
+                    & (Join-Path $baseDir 'AutoSync-Tick.ps1') -MainPullOnly
+                } catch {
+                    Write-HostLog "Warning: pre-launch pull skipped: $($_.Exception.Message)"
+                }
+                $syncFlags += ' -AutoSync'
+            }
+            if ($sc.autoPushOnExit) {
+                $syncFlags += ' -AutoPushOnExit'
+            }
+        } catch {}
+    }
+
+    $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$subScript`" -ProxyServer `"$proxyServer`" -ProxyEnable $proxyEnable$syncFlags"
+
+    Write-HostLog "Starting isolated process as $($cred.UserName) (ProxyEnable=$proxyEnable ProxyServer=$proxyServer Flags=$syncFlags)"
     Start-Process -FilePath $psExe -ArgumentList $argList -Credential $cred -WorkingDirectory $baseDir -WindowStyle Hidden
     Write-HostLog 'Launch dispatched successfully.'
     exit 0

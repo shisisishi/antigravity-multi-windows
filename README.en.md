@@ -19,9 +19,11 @@ Each extra Antigravity account runs under its own lightweight, standard local Wi
 - **Hidden from Windows Sign-In Screen**: Optionally hides helper local accounts via `HKLM\...\Winlogon\SpecialAccounts\UserList` so your lock screen remains clean.
 - **Per-Account Binary Copies**: Each account has its own copy under `%LOCALAPPDATA%\Programs\antigravity` and its own `HKCU` `antigravity://` handler, preventing auto-update file locks.
 - **Per-Account Proxy & Region Verification**: Automatically follows your Windows system proxy (or TUN routing) by default, or lets you assign a dedicated local proxy port and optional exit-region check per account in `proxies.json`.
-- **Projects & AI Chat History Sync**:
-  - Syncs real (non-sidecar) Projects with minimal folder-level ACLs (keeping your main `AppData` private) and automatically registers per-user Git `safe.directory`.
-  - Uses Python's standard library **`sqlite3.Connection.backup()`** to hot-backup your live main account conversations without closing it, and incrementally merges them into sub-accounts by `last_modified_time` (never deleting new chats created inside sub-accounts).
+- **Automatic Incremental Bidirectional Sync for Projects & AI Chats**:
+  - **Pre-Launch Auto-Sync (Cold Start)**: Launching an idle sub-account automatically pulls the latest Projects and conversations via a persistent `sync_pool` (typically `~1s` incrementally).
+  - **Post-Exit Auto-Push**: Closing a sub-account window automatically merges its new conversations and projects back into `sync_pool`.
+  - **10-Minute Silent Background Task**: User-level Windows Scheduled Task performs safe read-only SQLite hot-backups (`sqlite3.Connection.backup()`) across all accounts and pushes updates **only to idle accounts** (never interrupts running windows or corrupts live SQLite databases).
+  - Grants minimal folder-level ACLs on synced project directories (keeping your main `AppData` private) and configures per-user Git `safe.directory`.
 
 ---
 
@@ -84,11 +86,35 @@ Edit `C:\ProgramData\AntigravityMulti\proxies.json` (template in [`config/proxie
 
 ---
 
+## Automatic Sync Configuration (`sync-config.json`)
+
+Runtime configuration is stored at `C:\ProgramData\AntigravityMulti\sync-config.json` (template: [`config/sync-config.example.json`](./config/sync-config.example.json)):
+
+```json
+{
+  "autoSyncOnLaunch": true,
+  "autoPushOnExit": true,
+  "syncProjects": true,
+  "syncChats": true,
+  "syncBrain": true,
+  "backgroundIntervalMinutes": 10
+}
+```
+
+---
+
 ## Management Commands
 
 All maintenance actions live in `C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1`:
 
 ```powershell
+# Run an immediate incremental bidirectional sync across all accounts (non-disruptive)
+powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action AutoSyncNow
+
+# Enable / customize / disable silent background Windows Scheduled Task (no admin needed)
+powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action EnableAutoSync -IntervalMinutes 10
+powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action DisableAutoSync
+
 # Check configured accounts and running concurrent instances
 powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action Status
 
@@ -98,7 +124,7 @@ powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage
 # Quickly sync newly added Projects and folder ACLs (hot, no restart needed)
 powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action SyncProjects
 
-# Hot-backup and incrementally merge main AI conversations & brain artifacts into all sub-accounts
+# Force-merge main AI conversations & brain artifacts into all sub-accounts
 powershell -ExecutionPolicy Bypass -File "C:\ProgramData\AntigravityMulti\Manage-Accounts.ps1" -Action SyncChats
 
 # Grant all sub-accounts read/write access to any folder

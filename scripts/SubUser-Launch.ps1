@@ -1,6 +1,8 @@
 ﻿param(
     [string]$ProxyServer = '',
-    [int]$ProxyEnable = 0
+    [int]$ProxyEnable = 0,
+    [switch]$AutoSync,
+    [switch]$AutoPushOnExit
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,8 +63,46 @@ try {
         Remove-Item Env:HTTP_PROXY, Env:HTTPS_PROXY, Env:ALL_PROXY -ErrorAction SilentlyContinue
     }
 
-    Write-SubLog "Launching $appExe (ProxyEnable=$ProxyEnable ProxyServer=$ProxyServer)"
-    Start-Process -FilePath $appExe -ArgumentList '--remote-debugging-port=0' -WorkingDirectory $appDir
+    # 4. Cold-start auto-sync before launching Antigravity (never touches live SQLite if already running)
+    $myAppPrefix = $appDir.ToLowerInvariant()
+    $alreadyRunning = @(Get-CimInstance Win32_Process -Filter "Name='Antigravity.exe' OR Name='language_server.exe'" -ErrorAction SilentlyContinue | Where-Object {
+        $_.ExecutablePath -and $_.ExecutablePath.ToLowerInvariant().StartsWith($myAppPrefix)
+    }).Count -gt 0
+
+    $syncCfgPath = 'C:\ProgramData\AntigravityMulti\sync-config.json'
+    $syncProjects = $true; $syncChats = $true; $syncBrain = $true
+    if (Test-Path -LiteralPath $syncCfgPath -PathType Leaf) {
+        try {
+            $sc = Get-Content -LiteralPath $syncCfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($sc.PSObject.Properties['syncProjects']) { $syncProjects = [bool]$sc.syncProjects }
+            if ($sc.PSObject.Properties['syncChats']) { $syncChats = [bool]$sc.syncChats }
+            if ($sc.PSObject.Properties['syncBrain']) { $syncBrain = [bool]$sc.syncBrain }
+        } catch {}
+    }
+
+    if ($AutoSync -and !$alreadyRunning -and (Test-Path -LiteralPath 'C:\ProgramData\AntigravityMulti\SubUser-SyncTick.ps1')) {
+        Write-SubLog 'Running cold-start auto-sync before launching Antigravity...'
+        try {
+            & 'C:\ProgramData\AntigravityMulti\SubUser-SyncTick.ps1' -SyncProjects:$syncProjects -SyncChats:$syncChats -SyncBrain:$syncBrain
+        } catch {
+            Write-SubLog "Warning: cold-start auto-sync failed: $($_.Exception.Message)"
+        }
+    }
+
+    Write-SubLog "Launching $appExe (ProxyEnable=$ProxyEnable ProxyServer=$ProxyServer AlreadyRunning=$alreadyRunning)"
+    $proc = Start-Process -FilePath $appExe -ArgumentList '--remote-debugging-port=0' -WorkingDirectory $appDir -PassThru
+
+    # 5. Optional post-exit pull back into shared sync_pool when this window closes
+    if ($AutoPushOnExit -and !$alreadyRunning -and $proc -and (Test-Path -LiteralPath 'C:\ProgramData\AntigravityMulti\SubUser-SyncTick.ps1')) {
+        try {
+            $proc.WaitForExit()
+            Start-Sleep -Milliseconds 1500
+            Write-SubLog 'Antigravity exited; pulling new conversations/projects back to sync_pool...'
+            & 'C:\ProgramData\AntigravityMulti\SubUser-SyncTick.ps1' -SyncProjects:$syncProjects -SyncChats:$syncChats -SyncBrain:$syncBrain -PullOnly
+        } catch {
+            Write-SubLog "Warning: post-exit sync failed: $($_.Exception.Message)"
+        }
+    }
     exit 0
 } catch {
     Write-SubLog "LAUNCH_ERROR: $($_.Exception.Message)"

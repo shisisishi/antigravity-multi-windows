@@ -1,10 +1,11 @@
 ﻿param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Sync', 'SyncProjects', 'SyncChats', 'GrantFolder', 'LaunchAll', 'Add', 'Remove', 'Status')]
+    [ValidateSet('Sync', 'SyncProjects', 'SyncChats', 'AutoSyncNow', 'EnableAutoSync', 'DisableAutoSync', 'GrantFolder', 'LaunchAll', 'Add', 'Remove', 'Status')]
     [string]$Action,
     [string]$FolderPath = '',
     [int]$AccountNumber = 0,
     [string]$AccountName = '',
+    [int]$IntervalMinutes = 10,
     [switch]$ForceConfig
 )
 
@@ -261,6 +262,23 @@ switch ($Action) {
         if ($accts.Count -eq 0) { throw 'No sub-accounts configured yet.' }
         Sync-SubAccounts -Accounts $accts -IncludeChats
         Write-Host 'All projects and AI conversations synced successfully.'
+    }
+    'AutoSyncNow' {
+        & "$baseDir\AutoSync-Tick.ps1" -VerboseOutput
+        Write-Host 'Incremental bidirectional auto-sync tick completed.'
+    }
+    'EnableAutoSync' {
+        if ($IntervalMinutes -lt 1) { $IntervalMinutes = 10 }
+        $taskName = 'AntigravityMultiAutoSync'
+        $tr = "`"$env:SystemRoot\System32\wscript.exe`" `"$baseDir\SilentAutoSync.vbs`""
+        & schtasks.exe /Create /TN $taskName /SC MINUTE /MO $IntervalMinutes /TR $tr /F
+        if ($LASTEXITCODE -ne 0) { throw "Failed to register scheduled task $taskName" }
+        Write-Host "Background auto-sync enabled: every $IntervalMinutes minute(s) via Scheduled Task '$taskName'."
+    }
+    'DisableAutoSync' {
+        $taskName = 'AntigravityMultiAutoSync'
+        & schtasks.exe /Delete /TN $taskName /F 2>$null
+        Write-Host "Background auto-sync scheduled task '$taskName' removed."
     }
     'GrantFolder' {
         if (!$FolderPath -or !(Test-Path -LiteralPath $FolderPath -PathType Container)) {

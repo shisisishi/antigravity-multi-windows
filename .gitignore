@@ -2,12 +2,14 @@
 creds/
 status/
 seed/
+sync_pool/
 *.xml
 *.log
 *.status
 *.tmp
 config/proxies.json
 proxies.json
+sync-config.json
 __pycache__/
 *.pyc
 .DS_Store

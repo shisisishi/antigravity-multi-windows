@@ -1,0 +1,8 @@
+{
+  "autoSyncOnLaunch": true,
+  "autoPushOnExit": true,
+  "syncProjects": true,
+  "syncChats": true,
+  "syncBrain": true,
+  "backgroundIntervalMinutes": 10
+}
