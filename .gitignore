@@ -1,0 +1,14 @@
+# Local runtime state, credentials, and logs
+creds/
+status/
+seed/
+*.xml
+*.log
+*.status
+*.tmp
+config/proxies.json
+proxies.json
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

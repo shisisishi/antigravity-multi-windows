@@ -1,0 +1,17 @@
+{
+  "_comment": "Optional per-account proxy configuration. Leave proxy empty to automatically follow your current Windows system proxy (or direct/TUN routing). For stronger isolation, assign a dedicated local proxy port per account (e.g. '127.0.0.1:10802'). Set verifyRegion (e.g. 'US') to block launch if exit IP region mismatches; leave verifyRegion empty to skip region check.",
+  "accounts": {
+    "AgyAcc2": {
+      "proxy": "",
+      "verifyRegion": ""
+    },
+    "AgyAcc3": {
+      "proxy": "",
+      "verifyRegion": ""
+    },
+    "AgyAcc4": {
+      "proxy": "",
+      "verifyRegion": ""
+    }
+  }
+}
