@@ -23,7 +23,7 @@ Each extra Antigravity account runs under its own lightweight, standard local Wi
   - **Pre-Launch Auto-Sync (Cold Start)**: Launching an idle sub-account automatically pulls the latest Projects and conversations via a persistent `sync_pool` (typically `~1s` incrementally).
   - **Post-Exit Auto-Push**: Closing a sub-account window automatically merges its new conversations and projects back into `sync_pool`.
   - **10-Minute Silent Background Task + Live-Safe Online Push (`allowLivePush`)**: User-level Windows Scheduled Task performs safe read-only SQLite hot-backups (`sqlite3.Connection.backup()`) across all accounts and incrementally merges new conversations **even while windows remain open** (atomic copy for new `.db` files + SQLite WAL `BEGIN IMMEDIATE` summary merge, automatically skipping only actively modified/locked conversation `.db` files within the cooldown window).
-  - Grants minimal folder-level ACLs on synced project directories (keeping your main `AppData` private) and configures per-user Git `safe.directory`.
+  - **Bidirectional Cross-Account Project ACL Sharing**: Both main-account and sub-account project folders (e.g. projects created under `C:\Users\AgyAcc2\Documents\...`) are automatically granted minimal folder-level `(OI)(CI)M` permissions by their owner to all sibling accounts (never touching profile roots, `AppData`, or `.gemini`), alongside per-user Git `safe.directory` configuration — eliminating `Access is denied` errors when switching accounts.
 
 ---
 

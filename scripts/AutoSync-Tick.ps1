@@ -73,6 +73,46 @@ function Ensure-PoolPermissions {
     }
 }
 
+function Test-SafeProjectAclTarget {
+    param([string]$FolderPath)
+    if (!$FolderPath -or !(Test-Path -LiteralPath $FolderPath -PathType Container)) { return $false }
+    $norm = $FolderPath.TrimEnd('\').ToLowerInvariant()
+    $prof = $env:USERPROFILE.TrimEnd('\').ToLowerInvariant()
+    if ($norm -eq $prof) { return $false }
+    if ($norm.StartsWith("$prof\appdata") -or $norm.StartsWith("$prof\.gemini")) { return $false }
+    if ($norm -match '^[a-z]:$' -or $norm -eq 'c:\users' -or $norm -eq 'c:\windows') { return $false }
+    return $true
+}
+
+function Grant-OwnedProjectFolders {
+    param([string[]]$Folders, [string[]]$PeerAccounts)
+    if (!$PeerAccounts -or $PeerAccounts.Count -eq 0) { return 0 }
+    $granted = 0
+    $profPrefix = ($env:USERPROFILE.TrimEnd('\') + '\').ToLowerInvariant()
+    foreach ($fp in ($Folders | Select-Object -Unique)) {
+        try {
+            if (!(Test-SafeProjectAclTarget -FolderPath $fp)) { continue }
+            $acl = Get-Acl -LiteralPath $fp -ErrorAction Stop
+            $ownerUser = if ($acl.Owner) { $acl.Owner.Split('\')[-1] } else { '' }
+            $inOwnProfile = $fp.ToLowerInvariant().StartsWith($profPrefix)
+            if (!$inOwnProfile -and ($ownerUser -ine $env:USERNAME)) { continue }
+            $existing = @($acl.Access | Where-Object {
+                $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights.ToString() -match 'Modify|FullControl')
+            } | ForEach-Object { $_.IdentityReference.Value.Split('\')[-1] })
+            $missing = @($PeerAccounts | Where-Object { $_ -and ($_ -ine $env:USERNAME) -and ($existing -notcontains $_) })
+            if ($missing.Count -gt 0) {
+                $icArgs = @($fp)
+                foreach ($a in $missing) { $icArgs += '/grant'; $icArgs += "${a}:(OI)(CI)M" }
+                $icArgs += '/C'
+                & icacls.exe @icArgs 2>$null | Out-Null
+                $global:LASTEXITCODE = 0
+                $granted++
+            }
+        } catch {}
+    }
+    return $granted
+}
+
 function Sync-MainProjectsToPool {
     param([string[]]$Accounts)
     $mainProjectsDir = Join-Path $env:USERPROFILE '.gemini\config\projects'
@@ -99,29 +139,46 @@ function Sync-MainProjectsToPool {
         } catch {}
     }
 
-    # Ensure newly added project folders are accessible to sub-accounts (fast no-op when ACL already set)
-    foreach ($fp in ($folders | Select-Object -Unique)) {
-        $acl = Get-Acl -LiteralPath $fp
-        $existing = @($acl.Access | Where-Object {
-            $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights.ToString() -match 'Modify|FullControl')
-        } | ForEach-Object { $_.IdentityReference.Value.Split('\')[-1] })
-        $missing = @($Accounts | Where-Object { $existing -notcontains $_ })
-        if ($missing.Count -gt 0) {
-            $icArgs = @($fp)
-            foreach ($a in $missing) { $icArgs += '/grant'; $icArgs += "${a}:(OI)(CI)M" }
-            $icArgs += '/C'
-            & icacls.exe @icArgs | Out-Null
-        }
-    }
+    # Ensure main-owned project folders are accessible to all sub-accounts (fast no-op when ACL already set)
+    [void](Grant-OwnedProjectFolders -Folders $folders -PeerAccounts $Accounts)
 }
 
 function Sync-PoolProjectsToMain {
     $mainProjectsDir = Join-Path $env:USERPROFILE '.gemini\config\projects'
     New-Item -ItemType Directory -Force -Path $mainProjectsDir | Out-Null
+
+    $gitCmd = Get-Command git.exe -ErrorAction SilentlyContinue
+    $userGitConfig = Join-Path $env:USERPROFILE '.gitconfig'
+    $existingSafeDirs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    if ($gitCmd -and (Test-Path -LiteralPath $userGitConfig)) {
+        (& $gitCmd.Source config --file $userGitConfig --get-all safe.directory 2>$null) | ForEach-Object {
+            if ($_) { [void]$existingSafeDirs.Add($_.Trim()) }
+        }
+    }
+
     Get-ChildItem -LiteralPath $poolProjects -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object {
         $dst = Join-Path $mainProjectsDir $_.Name
         if (!(Test-Path -LiteralPath $dst -PathType Leaf)) {
             Copy-Item -LiteralPath $_.FullName -Destination $dst -Force -ErrorAction SilentlyContinue
+        }
+        if ($gitCmd) {
+            try {
+                $pj = Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+                if (!$pj.sidecar -and $pj.projectResources -and $pj.projectResources.resources) {
+                    foreach ($r in $pj.projectResources.resources) {
+                        if ($r.folderUri) {
+                            $decoded = [Uri]::UnescapeDataString(($r.folderUri -replace '^file:///', ''))
+                            if ($decoded -match '^[a-zA-Z]:/') {
+                                $gitPath = $decoded.Substring(0, 1).ToUpper() + $decoded.Substring(1)
+                                if (!$existingSafeDirs.Contains($gitPath)) {
+                                    & $gitCmd.Source config --file $userGitConfig --add safe.directory $gitPath 2>$null | Out-Null
+                                    [void]$existingSafeDirs.Add($gitPath)
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch {}
         }
     }
 }
@@ -142,6 +199,12 @@ try {
 
     if ($accounts.Count -eq 0) { exit 0 }
     Ensure-PoolPermissions -Accounts $accounts
+
+    $allAccounts = @($env:USERNAME) + $accounts
+    try {
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText((Join-Path $poolDir 'accounts.json'), ($allAccounts | ConvertTo-Json), $utf8NoBom)
+    } catch {}
 
     $py = Resolve-HostPython
     $pyHint = if ($py -and $py.Prefix.Count -eq 0) { $py.Exe } else { '' }
@@ -168,6 +231,7 @@ try {
     if ($cfg.syncBrain) { $flags += ' -SyncBrain' }
     if ($cfg.allowLivePush) { $flags += " -AllowLivePush -LiveCooldownSeconds $([int]$cfg.liveActiveCooldownSeconds)" }
     if ($pyHint) { $flags += " -PythonExe `"$pyHint`"" }
+    $flags += " -AllAccounts `"$($allAccounts -join ',')`""
 
     foreach ($acct in $accounts) {
         $credFile = Join-Path $credDir "$acct.xml"

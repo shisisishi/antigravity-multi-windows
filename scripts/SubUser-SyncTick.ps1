@@ -8,7 +8,8 @@
     [switch]$PullOnly,
     [switch]$PushIfIdle,
     [switch]$AllowLivePush,
-    [int]$LiveCooldownSeconds = 90
+    [int]$LiveCooldownSeconds = 90,
+    [string]$AllAccounts = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,23 +47,93 @@ function Test-OwnAntigravityRunning {
     return (@($procs).Count -gt 0)
 }
 
+function Test-SafeProjectAclTarget {
+    param([string]$FolderPath)
+    if (!$FolderPath -or !(Test-Path -LiteralPath $FolderPath -PathType Container)) { return $false }
+    $norm = $FolderPath.TrimEnd('\').ToLowerInvariant()
+    $prof = $env:USERPROFILE.TrimEnd('\').ToLowerInvariant()
+    if ($norm -eq $prof) { return $false }
+    if ($norm.StartsWith("$prof\appdata") -or $norm.StartsWith("$prof\.gemini")) { return $false }
+    if ($norm -match '^[a-z]:$' -or $norm -eq 'c:\users' -or $norm -eq 'c:\windows') { return $false }
+    return $true
+}
+
+function Resolve-PeerAccounts {
+    param([string]$ExplicitCsv, [string]$PoolRoot)
+    $list = @()
+    if ($ExplicitCsv) {
+        $list = @($ExplicitCsv.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    } else {
+        $accFile = Join-Path $PoolRoot 'accounts.json'
+        if (Test-Path -LiteralPath $accFile -PathType Leaf) {
+            try {
+                $parsed = Get-Content -LiteralPath $accFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                $list = @($parsed | ForEach-Object { [string]$_ } | Where-Object { $_ })
+            } catch {}
+        }
+    }
+    return @($list | Where-Object { $_ -and ($_ -ine $env:USERNAME) } | Select-Object -Unique)
+}
+
+function Grant-OwnedProjectFolders {
+    param([string[]]$Folders, [string[]]$PeerAccounts)
+    if (!$PeerAccounts -or $PeerAccounts.Count -eq 0) { return 0 }
+    $granted = 0
+    $profPrefix = ($env:USERPROFILE.TrimEnd('\') + '\').ToLowerInvariant()
+    foreach ($fp in ($Folders | Select-Object -Unique)) {
+        try {
+            if (!(Test-SafeProjectAclTarget -FolderPath $fp)) { continue }
+            $acl = Get-Acl -LiteralPath $fp -ErrorAction Stop
+            $ownerUser = if ($acl.Owner) { $acl.Owner.Split('\')[-1] } else { '' }
+            $inOwnProfile = $fp.ToLowerInvariant().StartsWith($profPrefix)
+            if (!$inOwnProfile -and ($ownerUser -ine $env:USERNAME)) { continue }
+            $existing = @($acl.Access | Where-Object {
+                $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights.ToString() -match 'Modify|FullControl')
+            } | ForEach-Object { $_.IdentityReference.Value.Split('\')[-1] })
+            $missing = @($PeerAccounts | Where-Object { $existing -notcontains $_ })
+            if ($missing.Count -gt 0) {
+                $icArgs = @($fp)
+                foreach ($a in $missing) { $icArgs += '/grant'; $icArgs += "${a}:(OI)(CI)M" }
+                $icArgs += '/C'
+                & icacls.exe @icArgs 2>$null | Out-Null
+                $global:LASTEXITCODE = 0
+                $granted++
+            }
+        } catch {}
+    }
+    return $granted
+}
+
 function Sync-ProjectsBidirectional {
-    param([string]$PoolProjectsDir)
+    param([string]$PoolProjectsDir, [string[]]$PeerAccounts = @())
     $localProjectsDir = Join-Path $env:USERPROFILE '.gemini\config\projects'
     New-Item -ItemType Directory -Force -Path $localProjectsDir, $PoolProjectsDir | Out-Null
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-    # 1. Push any newly added real (non-sidecar) projects from this sub-account to pool
+    # 1. Push any newly added/updated real (non-sidecar) projects from this sub-account to pool
+    #    and grant cross-account (OI)(CI)M ACLs on project folders owned by this sub-account
+    $ownedFolders = @()
     Get-ChildItem -LiteralPath $localProjectsDir -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object {
         try {
             $pj = Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
             if ($pj.sidecar) { return }
             $poolTarget = Join-Path $PoolProjectsDir "$($pj.id).json"
-            if (!(Test-Path -LiteralPath $poolTarget -PathType Leaf)) {
+            if (!(Test-Path -LiteralPath $poolTarget -PathType Leaf) -or ($_.LastWriteTimeUtc -gt (Get-Item -LiteralPath $poolTarget).LastWriteTimeUtc)) {
                 Copy-Item -LiteralPath $_.FullName -Destination $poolTarget -Force -ErrorAction SilentlyContinue
+            }
+            if ($pj.projectResources -and $pj.projectResources.resources) {
+                foreach ($r in $pj.projectResources.resources) {
+                    if ($r.folderUri) {
+                        $decoded = [Uri]::UnescapeDataString(($r.folderUri -replace '^file:///', '')).Replace('/', '\')
+                        if ($decoded -match '^[a-zA-Z]:\\' -and (Test-Path -LiteralPath $decoded -PathType Container)) {
+                            $ownedFolders += $decoded
+                        }
+                    }
+                }
             }
         } catch {}
     }
+    $aclGranted = Grant-OwnedProjectFolders -Folders $ownedFolders -PeerAccounts $PeerAccounts
 
     # 2. Pull any missing real projects from pool into this sub-account + register git safe.directory
     $existingByUri = @{}
@@ -122,7 +193,7 @@ function Sync-ProjectsBidirectional {
             }
         } catch {}
     }
-    return $added
+    return @{ Added = $added; AclGranted = $aclGranted }
 }
 
 try {
@@ -131,8 +202,12 @@ try {
     $subAgy = Join-Path $env:USERPROFILE '.gemini\antigravity'
 
     $projAdded = 0
+    $aclGranted = 0
     if ($SyncProjects) {
-        $projAdded = Sync-ProjectsBidirectional -PoolProjectsDir $poolProjects
+        $peers = Resolve-PeerAccounts -ExplicitCsv $AllAccounts -PoolRoot $PoolDir
+        $projRes = Sync-ProjectsBidirectional -PoolProjectsDir $poolProjects -PeerAccounts $peers
+        $projAdded = $projRes.Added
+        $aclGranted = $projRes.AclGranted
     }
 
     $pullInfo = 'skip'
@@ -167,7 +242,7 @@ try {
         }
     }
 
-    $summary = "OK|$env:USERNAME|projAdded=$projAdded|$pullInfo|$pushInfo"
+    $summary = "OK|$env:USERNAME|projAdded=$projAdded|aclGranted=$aclGranted|$pullInfo|$pushInfo"
     Write-SubLog $summary
     if ($StatusFile) { Set-Content -Path $StatusFile -Value $summary -Encoding UTF8 }
     exit 0
