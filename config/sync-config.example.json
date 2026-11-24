@@ -4,5 +4,7 @@
   "syncProjects": true,
   "syncChats": true,
   "syncBrain": true,
+  "allowLivePush": true,
+  "liveActiveCooldownSeconds": 90,
   "backgroundIntervalMinutes": 10
 }

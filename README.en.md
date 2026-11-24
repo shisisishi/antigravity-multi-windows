@@ -22,7 +22,7 @@ Each extra Antigravity account runs under its own lightweight, standard local Wi
 - **Automatic Incremental Bidirectional Sync for Projects & AI Chats**:
   - **Pre-Launch Auto-Sync (Cold Start)**: Launching an idle sub-account automatically pulls the latest Projects and conversations via a persistent `sync_pool` (typically `~1s` incrementally).
   - **Post-Exit Auto-Push**: Closing a sub-account window automatically merges its new conversations and projects back into `sync_pool`.
-  - **10-Minute Silent Background Task**: User-level Windows Scheduled Task performs safe read-only SQLite hot-backups (`sqlite3.Connection.backup()`) across all accounts and pushes updates **only to idle accounts** (never interrupts running windows or corrupts live SQLite databases).
+  - **10-Minute Silent Background Task + Live-Safe Online Push (`allowLivePush`)**: User-level Windows Scheduled Task performs safe read-only SQLite hot-backups (`sqlite3.Connection.backup()`) across all accounts and incrementally merges new conversations **even while windows remain open** (atomic copy for new `.db` files + SQLite WAL `BEGIN IMMEDIATE` summary merge, automatically skipping only actively modified/locked conversation `.db` files within the cooldown window).
   - Grants minimal folder-level ACLs on synced project directories (keeping your main `AppData` private) and configures per-user Git `safe.directory`.
 
 ---
@@ -97,9 +97,13 @@ Runtime configuration is stored at `C:\ProgramData\AntigravityMulti\sync-config.
   "syncProjects": true,
   "syncChats": true,
   "syncBrain": true,
+  "allowLivePush": true,
+  "liveActiveCooldownSeconds": 90,
   "backgroundIntervalMinutes": 10
 }
 ```
+
+- `allowLivePush` (default `true`): Enables live-safe incremental push while Antigravity windows stay open (skips only individual conversation `.db` files active within `liveActiveCooldownSeconds` or locked on disk). Set to `false` to defer all pushes until an account is idle.
 
 ---
 

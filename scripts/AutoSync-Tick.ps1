@@ -30,12 +30,14 @@ function Get-SyncConfig {
         syncProjects = $true
         syncChats = $true
         syncBrain = $true
+        allowLivePush = $true
+        liveActiveCooldownSeconds = 90
         backgroundIntervalMinutes = 10
     }
     if (Test-Path -LiteralPath $cfgPath -PathType Leaf) {
         try {
             $parsed = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            foreach ($prop in @('autoSyncOnLaunch','autoPushOnExit','syncProjects','syncChats','syncBrain','backgroundIntervalMinutes')) {
+            foreach ($prop in @('autoSyncOnLaunch','autoPushOnExit','syncProjects','syncChats','syncBrain','allowLivePush','liveActiveCooldownSeconds','backgroundIntervalMinutes')) {
                 if ($parsed.PSObject.Properties[$prop]) { $defaults.$prop = $parsed.$prop }
             }
         } catch {}
@@ -159,11 +161,12 @@ try {
 
     if ($MainPullOnly) { exit 0 }
 
-    # Step 2: Bidirectional tick across all sub-accounts (pull always, push only when idle)
+    # Step 2: Bidirectional tick across all sub-accounts (pull always; idle full push or live-safe WAL push when running)
     $flags = ''
     if ($cfg.syncProjects) { $flags += ' -SyncProjects' }
     if ($cfg.syncChats) { $flags += ' -SyncChats' }
     if ($cfg.syncBrain) { $flags += ' -SyncBrain' }
+    if ($cfg.allowLivePush) { $flags += " -AllowLivePush -LiveCooldownSeconds $([int]$cfg.liveActiveCooldownSeconds)" }
     if ($pyHint) { $flags += " -PythonExe `"$pyHint`"" }
 
     foreach ($acct in $accounts) {
@@ -179,7 +182,7 @@ try {
         Write-SyncLog "Sub($acct): $st"
     }
 
-    # Step 3: Pull any new sub-account projects back to main; push chats back to main ONLY when main is idle
+    # Step 3: Pull any new sub-account projects back to main; push chats back to main (idle full push or live-safe WAL push)
     if ($cfg.syncProjects) {
         Sync-PoolProjectsToMain
     }
@@ -189,6 +192,11 @@ try {
             $pushOut = & $py.Exe @pushArgs 2>&1
             $pushLine = ($pushOut | Where-Object { $_ -like 'PUSH_OK|*' } | Select-Object -Last 1)
             Write-SyncLog "Pool->Main: $pushLine"
+        } elseif ($cfg.allowLivePush) {
+            $pushArgs = @($py.Prefix) + @("$baseDir\sync_chats.py", 'push', '--pool-dir', $poolChats, '--account-antigravity', $mainAgy, '--live-safe', '--active-cooldown', "$([int]$cfg.liveActiveCooldownSeconds)") + $brainFlag
+            $pushOut = & $py.Exe @pushArgs 2>&1
+            $pushLine = ($pushOut | Where-Object { $_ -like 'PUSH_LIVE_OK|*' } | Select-Object -Last 1)
+            Write-SyncLog "Pool->Main (live): $pushLine"
         } else {
             Write-SyncLog 'Pool->Main: deferred (main Antigravity is running)'
         }

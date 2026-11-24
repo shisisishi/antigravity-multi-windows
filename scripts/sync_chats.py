@@ -133,11 +133,51 @@ def sync_annotations(src_ann: str, dst_ann: str) -> int:
     return copied
 
 
-def merge_summaries_db(src_sum_snapshot: str, dst_sum: str, target_cids: list) -> int:
+def atomic_copy_file(src_path: str, dst_path: str) -> None:
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    tmp_path = dst_path + f".{os.getpid()}.tmp"
+    try:
+        shutil.copy2(src_path, tmp_path)
+        os.replace(tmp_path, dst_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
+def is_db_recently_active(db_path: str, cooldown_sec: int = 90) -> bool:
+    if not os.path.isfile(db_path):
+        return False
+    now = time.time()
+    wal = db_path + "-wal"
+    shm = db_path + "-shm"
+    try:
+        if os.path.isfile(wal) and os.path.getsize(wal) > 0:
+            return True
+    except OSError:
+        return True
+    latest = 0.0
+    for p in (db_path, wal, shm):
+        try:
+            if os.path.isfile(p):
+                mt = os.path.getmtime(p)
+                if mt > latest:
+                    latest = mt
+        except OSError:
+            pass
+    return (now - latest) < cooldown_sec
+
+
+def merge_summaries_db(src_sum_snapshot: str, dst_sum: str, target_cids: list, live_safe: bool = False) -> int:
     if not os.path.isfile(src_sum_snapshot):
         return 0
     dst_existing = read_summary_times(dst_sum)
     if not dst_existing:
+        if live_safe and os.path.isfile(dst_sum):
+            return 0
         for suf in ("-wal", "-shm"):
             if os.path.exists(dst_sum + suf):
                 try:
@@ -145,28 +185,54 @@ def merge_summaries_db(src_sum_snapshot: str, dst_sum: str, target_cids: list) -
                 except OSError:
                     pass
         os.makedirs(os.path.dirname(dst_sum), exist_ok=True)
-        shutil.copy2(src_sum_snapshot, dst_sum)
+        atomic_copy_file(src_sum_snapshot, dst_sum)
         return len(read_summary_times(dst_sum))
 
     if not target_cids:
         return 0
 
-    con = sqlite3.connect(dst_sum, timeout=15.0)
+    con = sqlite3.connect(dst_sum, timeout=15.0, isolation_level=None)
     merged = 0
     try:
+        con.execute("PRAGMA busy_timeout = 15000")
         con.execute("ATTACH DATABASE ? AS srcdb", (src_sum_snapshot,))
-        for cid in target_cids:
-            con.execute("DELETE FROM main.conversation_summaries WHERE conversation_id = ?", (cid,))
-            con.execute("INSERT INTO main.conversation_summaries SELECT * FROM srcdb.conversation_summaries WHERE conversation_id = ?", (cid,))
-            con.execute("DELETE FROM main.conversation_parents WHERE conversation_id = ?", (cid,))
-            con.execute("INSERT INTO main.conversation_parents SELECT * FROM srcdb.conversation_parents WHERE conversation_id = ?", (cid,))
+        backoffs = (0.3, 0.7, 1.5, 2.5) if live_safe else (0.5,)
+        last_err = None
+        for attempt in range(len(backoffs) + 1):
+            merged = 0
             try:
-                con.execute("DELETE FROM main.conversations_fts WHERE conversation_id = ?", (cid,))
-                con.execute("INSERT INTO main.conversations_fts SELECT * FROM srcdb.conversations_fts WHERE conversation_id = ?", (cid,))
+                con.execute("BEGIN IMMEDIATE")
+                for cid in target_cids:
+                    con.execute("DELETE FROM main.conversation_summaries WHERE conversation_id = ?", (cid,))
+                    con.execute("INSERT INTO main.conversation_summaries SELECT * FROM srcdb.conversation_summaries WHERE conversation_id = ?", (cid,))
+                    con.execute("DELETE FROM main.conversation_parents WHERE conversation_id = ?", (cid,))
+                    con.execute("INSERT INTO main.conversation_parents SELECT * FROM srcdb.conversation_parents WHERE conversation_id = ?", (cid,))
+                    try:
+                        con.execute("DELETE FROM main.conversations_fts WHERE conversation_id = ?", (cid,))
+                        con.execute("INSERT INTO main.conversations_fts SELECT * FROM srcdb.conversations_fts WHERE conversation_id = ?", (cid,))
+                    except Exception:
+                        pass
+                    merged += 1
+                con.execute("COMMIT")
+                last_err = None
+                break
+            except sqlite3.OperationalError as exc:
+                last_err = exc
+                try:
+                    con.execute("ROLLBACK")
+                except Exception:
+                    pass
+                if attempt < len(backoffs) and ("locked" in str(exc).lower() or "busy" in str(exc).lower()):
+                    time.sleep(backoffs[attempt])
+                    continue
+                raise
+        if last_err is not None:
+            raise last_err
+        if live_safe:
+            try:
+                con.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except Exception:
                 pass
-            merged += 1
-        con.commit()
         con.execute("DETACH DATABASE srcdb")
     finally:
         con.close()
@@ -262,12 +328,21 @@ def pull_to_pool(account_agy: str, pool_dir: str, sync_brain: bool = True) -> No
         print(f"PULL_OK|updatedConvs={updated_convs}|mergedSummaries={merged_summaries}|brainFiles={brain_files}")
 
 
-def push_from_pool(pool_dir: str, account_agy: str, sync_brain: bool = True) -> None:
-    """Incrementally push newer conversations from shared sync_pool into an IDLE target account."""
+def push_from_pool(
+    pool_dir: str,
+    account_agy: str,
+    sync_brain: bool = True,
+    live_safe: bool = False,
+    active_cooldown: int = 90,
+) -> None:
+    """Incrementally push newer conversations from shared sync_pool into an idle or live-running account."""
     pool_sum = os.path.join(pool_dir, "conversation_summaries.db")
     pool_convs = os.path.join(pool_dir, "conversations")
     if not os.path.isfile(pool_sum) and not os.path.isdir(pool_convs):
-        print("PUSH_OK|convsCopied=0|summariesMerged=0|brainFiles=0")
+        if live_safe:
+            print("PUSH_LIVE_OK|convsCopied=0|skippedActive=0|summariesMerged=0|brainFiles=0")
+        else:
+            print("PUSH_OK|convsCopied=0|summariesMerged=0|brainFiles=0")
         return
 
     with pool_lock(pool_dir):
@@ -294,28 +369,60 @@ def push_from_pool(pool_dir: str, account_agy: str, sync_brain: bool = True) -> 
                     cids_to_copy.add(cid)
 
         convs_copied = 0
+        skipped_active = 0
+        skipped_cids = set()
         for cid in sorted(cids_to_copy):
             sp = os.path.join(pool_convs, cid + ".db")
             dp = os.path.join(dst_convs, cid + ".db")
             if not os.path.isfile(sp):
                 continue
-            for suf in ("-wal", "-shm"):
-                if os.path.exists(dp + suf):
-                    try:
-                        os.remove(dp + suf)
-                    except OSError:
-                        pass
-            shutil.copy2(sp, dp)
-            convs_copied += 1
+            if live_safe:
+                if os.path.isfile(dp) and is_db_recently_active(dp, active_cooldown):
+                    skipped_active += 1
+                    skipped_cids.add(cid)
+                    continue
+                try:
+                    atomic_copy_file(sp, dp)
+                    convs_copied += 1
+                except OSError:
+                    skipped_active += 1
+                    skipped_cids.add(cid)
+                    continue
+            else:
+                for suf in ("-wal", "-shm"):
+                    if os.path.exists(dp + suf):
+                        try:
+                            os.remove(dp + suf)
+                        except OSError:
+                            pass
+                atomic_copy_file(sp, dp)
+                convs_copied += 1
+
+        summaries_to_merge = [
+            cid for cid in newer_cids
+            if cid not in skipped_cids and (
+                os.path.isfile(os.path.join(dst_convs, cid + ".db"))
+                or not os.path.isfile(os.path.join(pool_convs, cid + ".db"))
+            )
+        ]
 
         summaries_merged = 0
-        if os.path.isfile(pool_sum) and (newer_cids or not os.path.isfile(dst_sum)):
-            summaries_merged = merge_summaries_db(pool_sum, dst_sum, newer_cids)
+        if os.path.isfile(pool_sum) and (summaries_to_merge or (not live_safe and not os.path.isfile(dst_sum))):
+            try:
+                summaries_merged = merge_summaries_db(pool_sum, dst_sum, summaries_to_merge, live_safe=live_safe)
+            except sqlite3.OperationalError as exc:
+                if live_safe:
+                    print(f"WARN: live summary merge busy: {exc}", file=sys.stderr)
+                else:
+                    raise
 
         proto_src = os.path.join(pool_dir, "agyhub_summaries_proto.pb")
         proto_dst = os.path.join(account_agy, "agyhub_summaries_proto.pb")
         if os.path.isfile(proto_src) and not os.path.isfile(proto_dst):
-            shutil.copy2(proto_src, proto_dst)
+            try:
+                atomic_copy_file(proto_src, proto_dst)
+            except OSError:
+                pass
 
         sync_annotations(os.path.join(pool_dir, "annotations"), os.path.join(account_agy, "annotations"))
 
@@ -323,15 +430,21 @@ def push_from_pool(pool_dir: str, account_agy: str, sync_brain: bool = True) -> 
         if sync_brain:
             pool_brain = os.path.join(pool_dir, "brain")
             dst_brain = os.path.join(account_agy, "brain")
-            brain_cids = set(cids_to_copy)
+            brain_cids = set(cid for cid in cids_to_copy if cid not in skipped_cids)
             if os.path.isdir(pool_brain):
                 for d in os.listdir(pool_brain):
-                    if os.path.isdir(os.path.join(pool_brain, d)) and not os.path.isdir(os.path.join(dst_brain, d)):
+                    if d not in skipped_cids and os.path.isdir(os.path.join(pool_brain, d)) and not os.path.isdir(os.path.join(dst_brain, d)):
                         brain_cids.add(d)
             if brain_cids:
                 brain_files = sync_brain_dirs(pool_brain, dst_brain, sorted(brain_cids))
 
-        print(f"PUSH_OK|convsCopied={convs_copied}|summariesMerged={summaries_merged}|brainFiles={brain_files}")
+        if live_safe:
+            print(
+                f"PUSH_LIVE_OK|convsCopied={convs_copied}|skippedActive={skipped_active}"
+                f"|summariesMerged={summaries_merged}|brainFiles={brain_files}"
+            )
+        else:
+            print(f"PUSH_OK|convsCopied={convs_copied}|summariesMerged={summaries_merged}|brainFiles={brain_files}")
 
 
 def main() -> int:
@@ -349,6 +462,8 @@ def main() -> int:
     p_push.add_argument("--pool-dir", required=True)
     p_push.add_argument("--account-antigravity", required=True)
     p_push.add_argument("--no-brain", action="store_true")
+    p_push.add_argument("--live-safe", action="store_true", help="Safe incremental push while Antigravity is running (skips active/locked conv DBs, WAL-safe summary merge)")
+    p_push.add_argument("--active-cooldown", type=int, default=90, help="Skip existing conv DBs modified within N seconds in --live-safe mode")
 
     # Legacy aliases for backwards compatibility
     p_exp = sub.add_parser("export-main")
@@ -363,7 +478,13 @@ def main() -> int:
     if args.cmd == "pull":
         pull_to_pool(args.account_antigravity, args.pool_dir, sync_brain=not args.no_brain)
     elif args.cmd == "push":
-        push_from_pool(args.pool_dir, args.account_antigravity, sync_brain=not args.no_brain)
+        push_from_pool(
+            args.pool_dir,
+            args.account_antigravity,
+            sync_brain=not args.no_brain,
+            live_safe=args.live_safe,
+            active_cooldown=args.active_cooldown,
+        )
     elif args.cmd == "export-main":
         pull_to_pool(args.main_antigravity, args.seed_dir, sync_brain=False)
     elif args.cmd == "merge-sub":

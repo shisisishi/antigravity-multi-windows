@@ -6,7 +6,9 @@
     [switch]$SyncChats,
     [switch]$SyncBrain,
     [switch]$PullOnly,
-    [switch]$PushIfIdle
+    [switch]$PushIfIdle,
+    [switch]$AllowLivePush,
+    [int]$LiveCooldownSeconds = 90
 )
 
 $ErrorActionPreference = 'Stop'
@@ -145,7 +147,7 @@ try {
             $pullInfo = ($pullOut | Where-Object { $_ -like 'PULL_OK|*' } | Select-Object -Last 1)
             if (!$pullInfo) { $pullInfo = 'pull-err' }
 
-            # Push from pool to this sub-account ONLY when idle (never writes live SQLite!)
+            # Push from pool to this sub-account: full push when idle, or live-safe WAL push when running
             if (!$PullOnly) {
                 $isRunning = Test-OwnAntigravityRunning
                 if (!$isRunning) {
@@ -153,6 +155,11 @@ try {
                     $pushOut = & $py.Exe @pushArgs 2>&1
                     $pushInfo = ($pushOut | Where-Object { $_ -like 'PUSH_OK|*' } | Select-Object -Last 1)
                     if (!$pushInfo) { $pushInfo = 'push-err' }
+                } elseif ($AllowLivePush) {
+                    $pushArgs = @($py.Prefix) + @('C:\ProgramData\AntigravityMulti\sync_chats.py', 'push', '--pool-dir', $poolChats, '--account-antigravity', $subAgy, '--live-safe', '--active-cooldown', "$LiveCooldownSeconds") + $brainFlag
+                    $pushOut = & $py.Exe @pushArgs 2>&1
+                    $pushInfo = ($pushOut | Where-Object { $_ -like 'PUSH_LIVE_OK|*' } | Select-Object -Last 1)
+                    if (!$pushInfo) { $pushInfo = 'push-live-err' }
                 } else {
                     $pushInfo = 'deferred-running'
                 }

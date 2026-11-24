@@ -22,7 +22,7 @@
 - **Projects & 历史 AI 对话全自动双向增量同步**：
   - **启动前秒同步（冷启动生效）**：双击任意副账号时自动增量拉取主账号及其他账号的最新 Projects 和对话（借助持久化中心同步池 `sync_pool`，增量同步通常仅需 `~1 秒`）。
   - **关闭后自动回传**：副账号窗口关闭后，自动把该账号新聊的对话与新建 Projects 合并回中心同步池。
-  - **后台每 10 分钟静默巡检**：通过用户级 Windows 计划任务自动只读热备份所有账号的新对话（基于 Python 标准库 `sqlite3.Connection.backup()`），并仅向当前空闲未运行的账号增量写入，**绝不强关正在使用的窗口、绝不损坏 SQLite 数据库、绝不误删副账号自己的新对话**。
+  - **后台每 10 分钟静默巡检 + 在线安全热下发（`allowLivePush`）**：通过用户级 Windows 计划任务自动只读热备份所有账号的新对话（基于 Python 标准库 `sqlite3.Connection.backup()`），并支持**窗口一直开着时也能自动增量合并新对话**（利用 SQLite WAL 并发事务写入 `conversation_summaries.db`，原子落盘新对话 `.db`，仅跳过最近 90 秒内正活跃/加锁的单个对话文件），**绝不强关正在使用的窗口、绝不损坏 SQLite 数据库、绝不误删副账号自己的新对话**。
   - 自动对具体项目目录授予最小读写权限（不暴露主用户 `AppData`），并自动配置各副账号的 Git `safe.directory`。
 
 ---
@@ -106,13 +106,15 @@ C:\ProgramData\AntigravityMulti\proxies.json
   "syncProjects": true,
   "syncChats": true,
   "syncBrain": true,
+  "allowLivePush": true,
+  "liveActiveCooldownSeconds": 90,
   "backgroundIntervalMinutes": 10
 }
 ```
 
 - `autoSyncOnLaunch`：冷启动任意副账号前自动增量同步最新 Projects 与对话。
 - `autoPushOnExit`：副账号窗口关闭后自动把新对话回传到中心同步池 `sync_pool`。
-- **安全机制**：对运行中账号仅执行 SQLite 只读热备份（Pull），对数据库写入（Push）仅在目标账号空闲未运行时执行，避免多进程写锁损坏。
+- `allowLivePush`（默认 `true`）：开启**在线安全热下发**，即使账号窗口一直开着也能自动合并其他账号的新对话；仅跳过 `liveActiveCooldownSeconds`（默认 `90` 秒）内正活跃写入或被占用的单个对话 `.db`（关闭/重开窗口后自动补齐）。设为 `false` 可回退为仅空闲时写入（`deferred-running`）。
 
 ---
 
